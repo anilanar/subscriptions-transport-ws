@@ -1,20 +1,23 @@
-declare let window: any;
-const _global = typeof global !== 'undefined' ? global : (typeof window !== 'undefined' ? window : {});
-const NativeWebSocket = _global.WebSocket || _global.MozWebSocket;
+import * as WS from "socket.io-client";
+import {
+  default as EventEmitterType,
+  EventEmitter,
+  ListenerFn
+} from "eventemitter3";
+import isString from "./utils/is-string";
+import isObject from "./utils/is-object";
+import { ExecutionResultDataDefault } from "graphql/execution/execute";
+import { print } from "graphql/language/printer";
+import { DocumentNode, ASTNode } from "graphql/language/ast";
+import { getOperationAST } from "graphql/utilities/getOperationAST";
+import $$observable from "symbol-observable";
 
-import * as Backoff from 'backo2';
-import { default as EventEmitterType, EventEmitter, ListenerFn } from 'eventemitter3';
-import isString from './utils/is-string';
-import isObject from './utils/is-object';
-import { ExecutionResult } from 'graphql/execution/execute';
-import { print } from 'graphql/language/printer';
-import { DocumentNode } from 'graphql/language/ast';
-import { getOperationAST } from 'graphql/utilities/getOperationAST';
-import $$observable from 'symbol-observable';
+import MessageTypes from "./message-types";
 
-import { GRAPHQL_WS } from './protocol';
-import { WS_TIMEOUT } from './defaults';
-import MessageTypes from './message-types';
+export interface ExecutionResult<TData = ExecutionResultDataDefault> {
+  errors?: ReadonlyArray<Error>;
+  data?: TData | null;
+}
 
 export interface Observer<T> {
   next?: (value: T) => void;
@@ -22,118 +25,100 @@ export interface Observer<T> {
   complete?: () => void;
 }
 
+export interface IncomingMessage {
+  id: string;
+  type: string;
+  payload: ExecutionResult;
+}
+
+export type OutgoingMessagePayload = { query: string | ASTNode } | object;
+
+export interface OperationHandler {
+  (errors: Error[], result: null): void;
+  (errors: null, result: ExecutionResult | null): void;
+}
+
+type OperationError =
+  | { errors?: readonly FormatedError[] }
+  | readonly FormatedError[]
+  | FormatedError;
+
 export interface Observable<T> {
-  subscribe(observer: Observer<T>): {
+  subscribe(
+    observer: Observer<T>
+  ): {
     unsubscribe: () => void;
   };
 }
 
-export interface OperationOptions {
-  query?: string | DocumentNode;
-  variables?: Object;
-  operationName?: string;
-  [key: string]: any;
+interface ConnectionCallback {
+  (error: Error[] | null, result: unknown): void;
 }
 
-export type FormatedError = Error & {
-  originalError?: any;
-};
+export interface OperationOptions {
+  query: string | DocumentNode;
+  variables?: Object;
+  operationName?: string;
+  [key: string]: unknown;
+}
+
+export interface FormatedError extends Error {
+  originalError?: unknown;
+}
 
 export interface Operation {
   options: OperationOptions;
-  handler: (error: Error[], result?: any) => void;
+  handler: OperationHandler;
 }
 
-export interface Operations {
-  [id: string]: Operation;
-}
+export type Operations = {
+  [K in string]?: Operation;
+};
 
 export interface Middleware {
   applyMiddleware(options: OperationOptions, next: Function): void;
 }
 
 export type ConnectionParams = {
-  [paramName: string]: any,
+  [paramName: string]: unknown;
 };
 
-export type ConnectionParamsOptions = ConnectionParams | Function | Promise<ConnectionParams>;
+export type ConnectionParamsOptions =
+  | ConnectionParams
+  | (() => Promise<ConnectionParams>)
+  | Promise<ConnectionParams>;
 
 export interface ClientOptions {
   connectionParams?: ConnectionParamsOptions;
-  timeout?: number;
+  connectionCallback?: ConnectionCallback;
+  lazy?: boolean;
   reconnect?: boolean;
   reconnectionAttempts?: number;
-  connectionCallback?: (error: Error[], result?: any) => void;
-  lazy?: boolean;
-  inactivityTimeout?: number;
 }
 
 export class SubscriptionClient {
-  public client: any;
+  public client: SocketIOClient.Socket | null;
   public operations: Operations;
   private url: string;
   private nextOperationId: number;
-  private connectionParams: Function;
-  private wsTimeout: number;
-  private unsentMessagesQueue: Array<any>; // queued messages while websocket is opening.
-  private reconnect: boolean;
-  private reconnecting: boolean;
-  private reconnectionAttempts: number;
-  private backoff: any;
-  private connectionCallback: any;
+  private connectionParams: () => Promise<ConnectionParams>;
+  private connectionCallback?: ConnectionCallback;
   private eventEmitter: EventEmitterType;
   private lazy: boolean;
-  private inactivityTimeout: number;
-  private inactivityTimeoutId: any;
-  private closedByUser: boolean;
-  private wsImpl: any;
-  private wsProtocols: string | string[];
-  private wasKeepAliveReceived: boolean;
-  private tryReconnectTimeoutId: any;
-  private checkConnectionIntervalId: any;
-  private maxConnectTimeoutId: any;
   private middlewares: Middleware[];
-  private maxConnectTimeGenerator: any;
 
-  constructor(
-    url: string,
-    options?: ClientOptions,
-    webSocketImpl?: any,
-    webSocketProtocols?: string | string[],
-  ) {
-    const {
-      connectionCallback = undefined,
-      connectionParams = {},
-      timeout = WS_TIMEOUT,
-      reconnect = false,
-      reconnectionAttempts = Infinity,
-      lazy = false,
-      inactivityTimeout = 0,
-    } = (options || {});
+  constructor(url: string, options?: ClientOptions) {
+    const { connectionCallback, connectionParams = {}, lazy = false } =
+      options || {};
 
-    this.wsImpl = webSocketImpl || NativeWebSocket;
-    if (!this.wsImpl) {
-      throw new Error('Unable to find native implementation, or alternative implementation for WebSocket!');
-    }
-
-    this.wsProtocols = webSocketProtocols || GRAPHQL_WS;
     this.connectionCallback = connectionCallback;
     this.url = url;
     this.operations = {};
     this.nextOperationId = 0;
-    this.wsTimeout = timeout;
-    this.unsentMessagesQueue = [];
-    this.reconnect = reconnect;
-    this.reconnecting = false;
-    this.reconnectionAttempts = reconnectionAttempts;
     this.lazy = !!lazy;
-    this.inactivityTimeout = inactivityTimeout;
-    this.closedByUser = false;
-    this.backoff = new Backoff({ jitter: 0.5 });
     this.eventEmitter = new EventEmitter();
     this.middlewares = [];
     this.client = null;
-    this.maxConnectTimeGenerator = this.createMaxConnectTimeGenerator();
     this.connectionParams = this.getConnectionParams(connectionParams);
 
     if (!this.lazy) {
@@ -141,86 +126,64 @@ export class SubscriptionClient {
     }
   }
 
-  public get status() {
-    if (this.client === null) {
-      return this.wsImpl.CLOSED;
-    }
+  // public get status() {
+  //   if (this.client === null) {
+  //     return this.wsImpl.CLOSED;
+  //   }
 
-    return this.client.readyState;
-  }
-
-  public close(isForced = true, closedByUser = true) {
-    this.clearInactivityTimeout();
-    if (this.client !== null) {
-      this.closedByUser = closedByUser;
-
-      if (isForced) {
-        this.clearCheckConnectionInterval();
-        this.clearMaxConnectTimeout();
-        this.clearTryReconnectTimeout();
-        this.unsubscribeAll();
-        this.sendMessage(undefined, MessageTypes.GQL_CONNECTION_TERMINATE, null);
-      }
-
-      this.client.close();
-      this.client = null;
-      this.eventEmitter.emit('disconnected');
-
-      if (!isForced) {
-        this.tryReconnect();
-      }
-    }
-  }
+  //   return this.client.readyState;
+  // }
 
   public request(request: OperationOptions): Observable<ExecutionResult> {
-    const getObserver = this.getObserver.bind(this);
-    const executeOperation = this.executeOperation.bind(this);
-    const unsubscribe = this.unsubscribe.bind(this);
-
-    let opId: string;
-
-    this.clearInactivityTimeout();
-
-    return {
+    const observable: Observable<ExecutionResult> = {
       [$$observable]() {
-        return this;
+        return observable;
       },
-      subscribe(
-        observerOrNext: ((Observer<ExecutionResult>) | ((v: ExecutionResult) => void)),
+      subscribe: (
+        observerOrNext:
+          | Observer<ExecutionResult>
+          | ((v: ExecutionResult) => void),
         onError?: (error: Error) => void,
-        onComplete?: () => void,
-      ) {
-        const observer = getObserver(observerOrNext, onError, onComplete);
+        onComplete?: () => void
+      ) => {
+        const observer = this.getObserver(observerOrNext, onError, onComplete);
 
-        opId = executeOperation(request, (error: Error[], result: any) => {
-          if ( error === null && result === null ) {
-            if ( observer.complete ) {
+        const handler: OperationHandler = (
+          error: Error[] | null,
+          result: ExecutionResult | null
+        ) => {
+          if (error === null && result === null) {
+            if (observer.complete) {
               observer.complete();
             }
           } else if (error) {
-            if ( observer.error ) {
+            if (observer.error) {
               observer.error(error[0]);
             }
           } else {
-            if ( observer.next ) {
-              observer.next(result);
+            if (observer.next) {
+              observer.next(result!);
             }
           }
-        });
+        };
+
+        const opId = this.executeOperation(request, handler);
 
         return {
           unsubscribe: () => {
-            if ( opId ) {
-              unsubscribe(opId);
-              opId = null;
-            }
-          },
+            this.unsubscribe(opId);
+          }
         };
-      },
+      }
     };
+    return observable;
   }
 
-  public on(eventName: string, callback: ListenerFn, context?: any): Function {
+  public on(
+    eventName: string,
+    callback: ListenerFn,
+    context?: unknown
+  ): Function {
     const handler = this.eventEmitter.on(eventName, callback, context);
 
     return () => {
@@ -228,40 +191,42 @@ export class SubscriptionClient {
     };
   }
 
-  public onConnected(callback: ListenerFn, context?: any): Function {
-    return this.on('connected', callback, context);
+  public onConnected(callback: ListenerFn, context?: unknown): Function {
+    return this.on("connected", callback, context);
   }
 
-  public onConnecting(callback: ListenerFn, context?: any): Function {
-    return this.on('connecting', callback, context);
+  public onConnecting(callback: ListenerFn, context?: unknown): Function {
+    return this.on("connecting", callback, context);
   }
 
-  public onDisconnected(callback: ListenerFn, context?: any): Function {
-    return this.on('disconnected', callback, context);
+  public onDisconnected(callback: ListenerFn, context?: unknown): Function {
+    return this.on("disconnected", callback, context);
   }
 
-  public onReconnected(callback: ListenerFn, context?: any): Function {
-    return this.on('reconnected', callback, context);
+  public onReconnected(callback: ListenerFn, context?: unknown): Function {
+    return this.on("reconnected", callback, context);
   }
 
-  public onReconnecting(callback: ListenerFn, context?: any): Function {
-    return this.on('reconnecting', callback, context);
+  public onReconnecting(callback: ListenerFn, context?: unknown): Function {
+    return this.on("reconnecting", callback, context);
   }
 
-  public onError(callback: ListenerFn, context?: any): Function {
-    return this.on('error', callback, context);
+  public onError(callback: ListenerFn, context?: unknown): Function {
+    return this.on("error", callback, context);
   }
 
   public unsubscribeAll() {
-    Object.keys(this.operations).forEach( subId => {
+    Object.keys(this.operations).forEach(subId => {
       this.unsubscribe(subId);
     });
   }
 
-  public applyMiddlewares(options: OperationOptions): Promise<OperationOptions> {
+  public applyMiddlewares(
+    options: OperationOptions
+  ): Promise<OperationOptions> {
     return new Promise((resolve, reject) => {
-      const queue = (funcs: Middleware[], scope: any) => {
-        const next = (error?: any) => {
+      const queue = (funcs: Middleware[], scope: unknown) => {
+        const next = (error?: unknown) => {
           if (error) {
             reject(error);
           } else {
@@ -283,32 +248,45 @@ export class SubscriptionClient {
   }
 
   public use(middlewares: Middleware[]): SubscriptionClient {
-    middlewares.map((middleware) => {
-      if (typeof middleware.applyMiddleware === 'function') {
+    middlewares.map(middleware => {
+      if (typeof middleware.applyMiddleware === "function") {
         this.middlewares.push(middleware);
       } else {
-        throw new Error('Middleware must implement the applyMiddleware function.');
+        throw new Error(
+          "Middleware must implement the applyMiddleware function."
+        );
       }
     });
 
     return this;
   }
 
-  private getConnectionParams(connectionParams: ConnectionParamsOptions): Function {
-    return (): Promise<ConnectionParams> => new Promise((resolve, reject) => {
-      if (typeof connectionParams === 'function') {
-        try {
-          return resolve(connectionParams.call(null));
-        } catch (error) {
-          return reject(error);
-        }
-      }
-
-      resolve(connectionParams);
-    });
+  public close() {
+    this.client?.close();
+    this.client = null;
   }
 
-  private executeOperation(options: OperationOptions, handler: (error: Error[], result?: any) => void): string {
+  private getConnectionParams(
+    connectionParams: ConnectionParamsOptions
+  ): () => Promise<ConnectionParams> {
+    return (): Promise<ConnectionParams> =>
+      new Promise((resolve, reject) => {
+        if (typeof connectionParams === "function") {
+          try {
+            return resolve(connectionParams.call(null));
+          } catch (error) {
+            return reject(error);
+          }
+        }
+
+        resolve(connectionParams);
+      });
+  }
+
+  private executeOperation(
+    options: OperationOptions,
+    handler: OperationHandler
+  ): string {
     if (this.client === null) {
       this.connect();
     }
@@ -318,351 +296,213 @@ export class SubscriptionClient {
 
     this.applyMiddlewares(options)
       .then(processedOptions => {
-        this.checkOperationOptions(processedOptions, handler);
+        this.checkOperationOptions(processedOptions);
         if (this.operations[opId]) {
           this.operations[opId] = { options: processedOptions, handler };
           this.sendMessage(opId, MessageTypes.GQL_START, processedOptions);
         }
       })
-      .catch(error => {
+      .catch((error: OperationError) => {
         this.unsubscribe(opId);
-        handler(this.formatErrors(error));
+        handler(this.formatErrors(error), null);
       });
 
     return opId;
   }
 
   private getObserver<T>(
-    observerOrNext: ((Observer<T>) | ((v: T) => void)),
+    observerOrNext: Observer<T> | ((v: T) => void),
     error?: (e: Error) => void,
-    complete?: () => void,
+    complete?: () => void
   ) {
-    if ( typeof observerOrNext === 'function' ) {
+    if (typeof observerOrNext === "function") {
       return {
         next: (v: T) => observerOrNext(v),
         error: (e: Error) => error && error(e),
-        complete: () => complete && complete(),
+        complete: () => complete && complete()
       };
     }
 
     return observerOrNext;
   }
 
-  private createMaxConnectTimeGenerator() {
-    const minValue = 1000;
-    const maxValue = this.wsTimeout;
-
-    return new Backoff({
-      min: minValue,
-      max: maxValue,
-      factor: 1.2,
-    });
-  }
-
-  private clearCheckConnectionInterval() {
-    if (this.checkConnectionIntervalId) {
-      clearInterval(this.checkConnectionIntervalId);
-      this.checkConnectionIntervalId = null;
-    }
-  }
-
-  private clearMaxConnectTimeout() {
-    if (this.maxConnectTimeoutId) {
-      clearTimeout(this.maxConnectTimeoutId);
-      this.maxConnectTimeoutId = null;
-    }
-    }
-
-  private clearTryReconnectTimeout() {
-    if (this.tryReconnectTimeoutId) {
-      clearTimeout(this.tryReconnectTimeoutId);
-      this.tryReconnectTimeoutId = null;
-    }
-  }
-
-  private clearInactivityTimeout() {
-    if (this.inactivityTimeoutId) {
-      clearTimeout(this.inactivityTimeoutId);
-      this.inactivityTimeoutId = null;
-    }
-  }
-
-  private setInactivityTimeout() {
-    if (this.inactivityTimeout > 0 && Object.keys(this.operations).length === 0) {
-      this.inactivityTimeoutId = setTimeout(() => {
-        if (Object.keys(this.operations).length === 0) {
-          this.close();
-        }
-      }, this.inactivityTimeout);
-    }
-  }
-
-  private checkOperationOptions(options: OperationOptions, handler: (error: Error[], result?: any) => void) {
+  private checkOperationOptions(options: OperationOptions) {
     const { query, variables, operationName } = options;
 
-    if (!query) {
-      throw new Error('Must provide a query.');
-    }
-
-    if (!handler) {
-      throw new Error('Must provide an handler.');
-    }
-
     if (
-      ( !isString(query) && !getOperationAST(query, operationName)) ||
-      ( operationName && !isString(operationName)) ||
-      ( variables && !isObject(variables))
+      (!isString(query) && !getOperationAST(query, operationName)) ||
+      (operationName && !isString(operationName)) ||
+      (variables && !isObject(variables))
     ) {
-      throw new Error('Incorrect option types. query must be a string or a document,' +
-        '`operationName` must be a string, and `variables` must be an object.');
+      throw new Error(
+        "Incorrect option types. query must be a string or a document," +
+          "`operationName` must be a string, and `variables` must be an object."
+      );
     }
   }
 
-  private buildMessage(id: string, type: string, payload: any) {
-    const payloadToReturn = payload && payload.query ?
-      {
-        ...payload,
-        query: typeof payload.query === 'string' ? payload.query : print(payload.query),
-      } :
-      payload;
+  private buildMessage(
+    id: string | undefined,
+    type: string,
+    payload: OutgoingMessagePayload
+  ) {
+    const payloadToReturn =
+      "query" in payload
+        ? {
+            ...payload,
+            query:
+              typeof payload.query === "string"
+                ? payload.query
+                : print(payload.query)
+          }
+        : payload;
 
     return {
       id,
       type,
-      payload: payloadToReturn,
+      payload: payloadToReturn
     };
   }
 
   // ensure we have an array of errors
-  private formatErrors(errors: any): FormatedError[] {
+  private formatErrors(errors: OperationError): FormatedError[] {
     if (Array.isArray(errors)) {
       return errors;
     }
 
     // TODO  we should not pass ValidationError to callback in the future.
     // ValidationError
-    if (errors && errors.errors) {
+    if ("errors" in errors && errors.errors) {
       return this.formatErrors(errors.errors);
     }
 
-    if (errors && errors.message) {
+    if ("message" in errors && errors.message) {
       return [errors];
     }
 
-    return [{
-      name: 'FormatedError',
-      message: 'Unknown error',
-      originalError: errors,
-    }];
+    return [
+      {
+        name: "FormatedError",
+        message: "Unknown error",
+        originalError: errors
+      }
+    ];
   }
 
-  private sendMessage(id: string, type: string, payload: any) {
+  private sendMessage(
+    id: string | undefined,
+    type: string,
+    payload: OutgoingMessagePayload
+  ) {
     this.sendMessageRaw(this.buildMessage(id, type, payload));
   }
 
-  // send message, or queue it if connection is not open
-  private sendMessageRaw(message: Object) {
-    switch (this.status) {
-      case this.wsImpl.OPEN:
-        let serializedMessage: string = JSON.stringify(message);
-        try {
-          JSON.parse(serializedMessage);
-        } catch (e) {
-          this.eventEmitter.emit('error', new Error(`Message must be JSON-serializable. Got: ${message}`));
-        }
-
-        this.client.send(serializedMessage);
-        break;
-      case this.wsImpl.CONNECTING:
-        this.unsentMessagesQueue.push(message);
-
-        break;
-      default:
-        if (!this.reconnecting) {
-          this.eventEmitter.emit('error', new Error('A message was not sent because socket is not connected, is closing or ' +
-            'is already closed. Message was: ' + JSON.stringify(message)));
-        }
-    }
+  private sendMessageRaw(message: unknown) {
+    this.client!.send(message);
   }
 
   private generateOperationId(): string {
     return String(++this.nextOperationId);
   }
 
-  private tryReconnect() {
-    if (!this.reconnect || this.backoff.attempts >= this.reconnectionAttempts) {
-      return;
-    }
-
-    if (!this.reconnecting) {
-      Object.keys(this.operations).forEach((key) => {
-        this.unsentMessagesQueue.push(
-          this.buildMessage(key, MessageTypes.GQL_START, this.operations[key].options),
-        );
-      });
-      this.reconnecting = true;
-    }
-
-    this.clearTryReconnectTimeout();
-
-    const delay = this.backoff.duration();
-    this.tryReconnectTimeoutId = setTimeout(() => {
-      this.connect();
-    }, delay);
-  }
-
-  private flushUnsentMessagesQueue() {
-    this.unsentMessagesQueue.forEach((message) => {
-      this.sendMessageRaw(message);
-    });
-    this.unsentMessagesQueue = [];
-  }
-
-  private checkConnection() {
-    if (this.wasKeepAliveReceived) {
-      this.wasKeepAliveReceived = false;
-      return;
-    }
-
-    if (!this.reconnecting) {
-      this.close(false, true);
-    }
-  }
-
-  private checkMaxConnectTimeout() {
-    this.clearMaxConnectTimeout();
-
-    // Max timeout trying to connect
-    this.maxConnectTimeoutId = setTimeout(() => {
-      if (this.status !== this.wsImpl.OPEN) {
-        this.reconnecting = true;
-        this.close(false, true);
-      }
-    }, this.maxConnectTimeGenerator.duration());
-  }
-
-  private connect() {
-    this.client = new this.wsImpl(this.url, this.wsProtocols);
-
-    this.checkMaxConnectTimeout();
-
-    this.client.onopen = async () => {
-      if (this.status === this.wsImpl.OPEN) {
-        this.clearMaxConnectTimeout();
-        this.closedByUser = false;
-        this.eventEmitter.emit(this.reconnecting ? 'reconnecting' : 'connecting');
-
-        try {
-          const connectionParams: ConnectionParams = await this.connectionParams();
-
-          // Send CONNECTION_INIT message, no need to wait for connection to success (reduce roundtrips)
-          this.sendMessage(undefined, MessageTypes.GQL_CONNECTION_INIT, connectionParams);
-          this.flushUnsentMessagesQueue();
-        } catch (error) {
-          this.sendMessage(undefined, MessageTypes.GQL_CONNECTION_ERROR, error);
-          this.flushUnsentMessagesQueue();
-        }
-      }
-    };
-
-    this.client.onclose = () => {
-      if (!this.closedByUser) {
-        this.close(false, false);
-      }
-    };
-
-    this.client.onerror = (err: Error) => {
-      // Capture and ignore errors to prevent unhandled exceptions, wait for
-      // onclose to fire before attempting a reconnect.
-      this.eventEmitter.emit('error', err);
-    };
-
-    this.client.onmessage = ({ data }: {data: any}) => {
-      this.processReceivedData(data);
-    };
-  }
-
-  private processReceivedData(receivedData: any) {
-    let parsedMessage: any;
-    let opId: string;
-
+  private async connect() {
+    this.client = WS(this.url);
     try {
-      parsedMessage = JSON.parse(receivedData);
-      opId = parsedMessage.id;
-    } catch (e) {
-      throw new Error(`Message must be JSON-parseable. Got: ${receivedData}`);
+      this.sendMessage(
+        undefined,
+        MessageTypes.GQL_CONNECTION_INIT,
+        await this.connectionParams()
+      );
+    } catch (err) {
+      this.sendMessage(undefined, MessageTypes.GQL_CONNECTION_ERROR, {
+        error: err
+      });
     }
+
+    this.client.on("disconnect", () => {
+      this.unsubscribeAll();
+      this.eventEmitter.emit("disconnected");
+      this.client!.close();
+      this.client = null;
+    });
+
+    this.client.on("connect_error", (err: Error) => {
+      this.eventEmitter.emit("error", err);
+    });
+
+    this.client.on("error", (err: Error) => {
+      this.eventEmitter.emit("error", err);
+    });
+
+    this.client.on("message", (data: IncomingMessage) => {
+      this.processReceivedData(data);
+    });
+  }
+
+  private processReceivedData(msg: IncomingMessage) {
+    console.log("msg", msg);
+    const opId = msg.id;
 
     if (
-      [ MessageTypes.GQL_DATA,
+      [
+        MessageTypes.GQL_DATA,
         MessageTypes.GQL_COMPLETE,
-        MessageTypes.GQL_ERROR,
-      ].indexOf(parsedMessage.type) !== -1 && !this.operations[opId]
+        MessageTypes.GQL_ERROR
+      ].indexOf(msg.type) !== -1 &&
+      !this.operations[opId]
     ) {
       this.unsubscribe(opId);
 
       return;
     }
 
-    switch (parsedMessage.type) {
+    switch (msg.type) {
       case MessageTypes.GQL_CONNECTION_ERROR:
         if (this.connectionCallback) {
-          this.connectionCallback(parsedMessage.payload);
+          this.connectionCallback(msg.payload as Error[], null);
         }
         break;
 
       case MessageTypes.GQL_CONNECTION_ACK:
-        this.eventEmitter.emit(this.reconnecting ? 'reconnected' : 'connected');
-        this.reconnecting = false;
-        this.backoff.reset();
-        this.maxConnectTimeGenerator.reset();
+        this.eventEmitter.emit("connected");
 
         if (this.connectionCallback) {
-          this.connectionCallback();
+          this.connectionCallback(null, null);
         }
         break;
 
       case MessageTypes.GQL_COMPLETE:
-        this.operations[opId].handler(null, null);
+        this.operations[opId]!.handler(null, null);
         delete this.operations[opId];
         break;
 
       case MessageTypes.GQL_ERROR:
-        this.operations[opId].handler(this.formatErrors(parsedMessage.payload), null);
+        this.operations[opId]!.handler(
+          this.formatErrors(msg.payload as OperationError),
+          null
+        );
         delete this.operations[opId];
         break;
 
       case MessageTypes.GQL_DATA:
-        const parsedPayload = !parsedMessage.payload.errors ?
-          parsedMessage.payload : {...parsedMessage.payload, errors: this.formatErrors(parsedMessage.payload.errors)};
-        this.operations[opId].handler(null, parsedPayload);
-        break;
-
-      case MessageTypes.GQL_CONNECTION_KEEP_ALIVE:
-        const firstKA = typeof this.wasKeepAliveReceived === 'undefined';
-        this.wasKeepAliveReceived = true;
-
-        if (firstKA) {
-          this.checkConnection();
-        }
-
-        if (this.checkConnectionIntervalId) {
-          clearInterval(this.checkConnectionIntervalId);
-          this.checkConnection();
-        }
-        this.checkConnectionIntervalId = setInterval(this.checkConnection.bind(this), this.wsTimeout);
+        const parsedPayload: ExecutionResult = !msg.payload.errors
+          ? msg.payload
+          : {
+              ...msg.payload,
+              errors: this.formatErrors(msg.payload.errors)
+            };
+        this.operations[opId]!.handler(null, parsedPayload);
         break;
 
       default:
-        throw new Error('Invalid message type!');
+        throw new Error("Invalid message type!");
     }
   }
 
   private unsubscribe(opId: string) {
     if (this.operations[opId]) {
       delete this.operations[opId];
-      this.setInactivityTimeout();
-      this.sendMessage(opId, MessageTypes.GQL_STOP, undefined);
+      this.sendMessage(opId, MessageTypes.GQL_STOP, {});
     }
   }
 }

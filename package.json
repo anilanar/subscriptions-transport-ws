@@ -1,7 +1,7 @@
 {
-  "name": "subscriptions-transport-ws",
-  "version": "0.9.16",
-  "description": "A websocket transport for GraphQL subscriptions",
+  "name": "subscriptions-transport-socket.io",
+  "version": "0.0.1",
+  "description": "A socket.io transport for GraphQL subscriptions",
   "main": "dist/index.js",
   "browser": "dist/client.js",
   "repository": {
@@ -9,11 +9,11 @@
     "url": "git+https://github.com/apollostack/subscriptions-transport-ws.git"
   },
   "dependencies": {
-    "backo2": "^1.0.2",
     "eventemitter3": "^3.1.0",
     "iterall": "^1.2.1",
-    "symbol-observable": "^1.0.4",
-    "ws": "^5.2.0"
+    "socket.io": "^2.3.0",
+    "socket.io-client": "^2.3.0",
+    "symbol-observable": "^1.0.4"
   },
   "scripts": {
     "clean": "rimraf browser dist coverage",
@@ -34,13 +34,13 @@
   },
   "devDependencies": {
     "@types/chai": "^4.0.0",
-    "@types/graphql": "^14.0.0",
     "@types/is-promise": "^2.1.0",
     "@types/lodash": "^4.14.109",
     "@types/mocha": "^5.2.5",
     "@types/node": "^8.0.8",
     "@types/sinon": "^5.0.1",
-    "@types/ws": "^5.1.2",
+    "@types/socket.io": "^2.1.4",
+    "@types/socket.io-client": "^1.4.32",
     "chai": "^4.0.2",
     "graphql": "^14.0.2",
     "graphql-subscriptions": "^1.0.0",
@@ -52,7 +52,7 @@
     "rimraf": "^2.6.1",
     "sinon": "^6.1.4",
     "tslint": "^5.10.0",
-    "typescript": "^2.9.1",
+    "typescript": "^3.0.0",
     "webpack": "^3.1.0"
   },
   "typings": "dist/index.d.ts",
